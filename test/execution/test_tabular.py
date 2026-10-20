@@ -16,6 +16,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+import sdm.execution._tabular_icl as icl
+import sdm.execution.tabular as tabular
 import sdm.processing as sp
 from sdm import CategoricalTensor, Recipe, Stype, TableTensor, Task
 from sdm.execution import tabular_execution
@@ -730,4 +732,99 @@ def rejected_query_packing(rank: int, directory: str) -> None:
 def test_root_query_packing_failure_reaches_peers(tmp_path: Path) -> None:
     mp.spawn(
         rejected_query_packing, args=(str(tmp_path),), nprocs=2, join=True
+    )
+
+
+def rejected_rank_allocation(rank: int, directory: str, stage: str) -> None:
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{directory}/rank-allocation",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=15),
+    )
+    try:
+        model, x, y, query = fixture("regression")
+        run = execution(model, dist.group.WORLD)
+        failure = RuntimeError(f"rank-local {stage} allocation failed")
+        original_clone = torch.Tensor.clone
+        original_empty = torch.Tensor.new_empty
+        original_contiguous = torch.Tensor.contiguous
+        original_predict = icl.predict_icl
+
+        def inject_clone(block, state, cache):
+            def clone(value, *args, **kwargs):
+                if rank == 0 and value is state:
+                    raise failure
+                return original_clone(value, *args, **kwargs)
+
+            with patch.object(torch.Tensor, "clone", clone):
+                return original_predict(block, state, cache)
+
+        def new_empty(value, *args, **kwargs):
+            caller = sys._getframe(1).f_code.co_filename
+            if (
+                rank == 0
+                and caller.endswith("/tabular.py")
+                and args == ((0,),)
+            ):
+                raise failure
+            return original_empty(value, *args, **kwargs)
+
+        def contiguous(value, *args, **kwargs):
+            caller = sys._getframe(1).f_code.co_filename
+            if (
+                rank == 0
+                and caller.endswith("/_tabular_icl.py")
+                and tuple(value.shape) == (11, 8, 4)
+            ):
+                raise failure
+            return original_contiguous(value, *args, **kwargs)
+
+        def fit():
+            run.fit(
+                x if rank == 0 else None,
+                y if rank == 0 else None,
+                recipe=Recipe(),
+            )
+
+        if stage != "fit-gather":
+            fit()
+        scope = (
+            patch.object(tabular, "predict_icl", inject_clone)
+            if stage == "query-clone"
+            else patch.object(torch.Tensor, "new_empty", new_empty)
+            if stage == "empty-labels"
+            else patch.object(torch.Tensor, "contiguous", contiguous)
+        )
+        operation = (
+            fit
+            if stage == "fit-gather"
+            else lambda: run.predict(query if rank == 0 else None)
+        )
+        with scope, pytest.raises(RuntimeError, match=stage) as caught:
+            operation()
+        if rank == 0:
+            assert caught.value is failure
+        with pytest.raises(RuntimeError, match=stage) as repeated:
+            run.close()
+        assert caught.value is repeated.value
+        # A peer timeout is not acceptable error propagation.
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize(
+    "stage", ["query-clone", "empty-labels", "fit-gather"]
+)
+def test_rank_local_allocation_reaches_peers(
+    tmp_path: Path, stage: str
+) -> None:
+    mp.spawn(
+        rejected_rank_allocation,
+        args=(str(tmp_path), stage),
+        nprocs=2,
+        join=True,
     )

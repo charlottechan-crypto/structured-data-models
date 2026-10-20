@@ -667,11 +667,13 @@ class TabularExecution:
             src=self.exchange.members[0],
             group=self.exchange.group,
         )
-        empty = local.new_empty(
-            (0,),
-            dtype=torch.int64
-            if self.task == Task.classification
-            else local.dtype,
+        empty = self.exchange.attempt(
+            lambda: local.new_empty(
+                (0,),
+                dtype=torch.int64
+                if self.task == Task.classification
+                else local.dtype,
+            )
         )
         state = self.exchange.attempt(
             lambda: self._core.row_embedding(

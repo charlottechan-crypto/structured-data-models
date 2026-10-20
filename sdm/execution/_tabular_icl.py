@@ -79,7 +79,7 @@ def fit_icl(
             )
         )
         dist.all_gather_into_tensor(received, source, group=exchange.group)
-        result = received.movedim(0, -2).contiguous()
+        result = exchange.attempt(lambda: received.movedim(0, -2).contiguous())
         if fit_head_gather_window is not None and result.is_cuda:
             # The copy of the gathered heads is ordered after NCCL on this
             # stream. Bound host enqueue lead without a device-wide fence.
@@ -137,7 +137,7 @@ def workspace_bytes(model: ICLBlock, rows: int, cache: OwnedCache) -> int:
 
 def predict_icl(model: ICLBlock, query: Tensor, cache: OwnedCache) -> Tensor:
     """Replay each full original query with one gathered KV layer at a time."""
-    state = query.clone()
+    state = cache.exchange.attempt(query.clone)
     for index, layer in enumerate(model.layers):
         pair = cache[f"icl_block.layer{index}"]
         state = cache.exchange.attempt(
