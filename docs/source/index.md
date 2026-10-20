@@ -30,6 +30,7 @@ overview
 
 tensor
 icl
+kumotabular-context-sharding
 processing
 nim
 ```

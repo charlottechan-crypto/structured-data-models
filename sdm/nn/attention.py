@@ -4,6 +4,8 @@
 """Attention modules for structured tensor models."""
 
 import math
+from collections.abc import Callable
+from functools import partial
 from typing import Any, Literal, overload
 
 import torch
@@ -70,6 +72,7 @@ class SDPA(torch.nn.Module):
         attn_mask: Tensor | None = None,  # [..., Hq, Q, KV]
         *,
         is_causal: bool = False,
+        _already_scaled: bool = False,
     ) -> Tensor:  # [..., Q, Hq, C]
         r"""The forward pass.
 
@@ -113,7 +116,7 @@ class SDPA(torch.nn.Module):
             batch_shapes.append(attn_mask.size()[:-3])
         batch_shape = torch.broadcast_shapes(*batch_shapes)
 
-        if self.query_scaling is not None:
+        if self.query_scaling is not None and not _already_scaled:
             if attn_mask is not None and attn_mask.dtype != torch.bool:
                 raise ValueError(
                     "Query scaling requires boolean attention mask"
@@ -288,6 +291,7 @@ class Attention(torch.nn.Module):
         *,
         is_causal: bool = False,
         return_key_value: Literal[False] = False,
+        _attention: Callable[..., Tensor] | None = None,
     ) -> Tensor: ...
 
     @overload
@@ -302,6 +306,7 @@ class Attention(torch.nn.Module):
         *,
         is_causal: bool = False,
         return_key_value: Literal[True],
+        _attention: Callable[..., Tensor] | None = None,
     ) -> tuple[Tensor, KVCacheEntry]: ...
 
     @overload
@@ -316,6 +321,7 @@ class Attention(torch.nn.Module):
         *,
         is_causal: bool = False,
         return_key_value: bool,
+        _attention: Callable[..., Tensor] | None = None,
     ) -> Tensor | tuple[Tensor, KVCacheEntry]: ...
 
     def forward(
@@ -329,6 +335,7 @@ class Attention(torch.nn.Module):
         *,
         is_causal: bool = False,
         return_key_value: bool = False,
+        _attention: Callable[..., Tensor] | None = None,
     ) -> Tensor | tuple[Tensor, KVCacheEntry]:  # [..., Q, C]
         r"""The forward pass.
 
@@ -421,7 +428,10 @@ class Attention(torch.nn.Module):
             else:
                 key = self.key_transform(key, pos=key_pos)
 
-        out = self.sdpa(
+        attention = (
+            self.sdpa if _attention is None else partial(_attention, self.sdpa)
+        )
+        out = attention(
             query=query,  # [..., Q, Hq, C // Hq]
             key=key,  # [..., KV, Hkv, C // Hq]
             value=value,  # [..., KV, Hkv, C // Hq]
@@ -527,6 +537,7 @@ class TransformerBlock(torch.nn.Module):
         *,
         is_causal: bool = False,
         return_key_value: Literal[False] = False,
+        _attention: Callable[..., Tensor] | None = None,
         batch_size_limit: int | Literal["auto"] | None = None,
         out: Tensor | None = None,
     ) -> Tensor: ...
@@ -543,6 +554,7 @@ class TransformerBlock(torch.nn.Module):
         *,
         is_causal: bool = False,
         return_key_value: Literal[True],
+        _attention: Callable[..., Tensor] | None = None,
         batch_size_limit: int | Literal["auto"] | None = None,
         out: Tensor | None = None,
     ) -> tuple[Tensor, KVCacheEntry]: ...
@@ -559,6 +571,7 @@ class TransformerBlock(torch.nn.Module):
         *,
         is_causal: bool = False,
         return_key_value: bool,
+        _attention: Callable[..., Tensor] | None = None,
         batch_size_limit: int | Literal["auto"] | None = None,
         out: Tensor | None = None,
     ) -> Tensor | tuple[Tensor, KVCacheEntry]: ...
@@ -574,6 +587,7 @@ class TransformerBlock(torch.nn.Module):
         *,
         is_causal: bool = False,
         return_key_value: bool = False,
+        _attention: Callable[..., Tensor] | None = None,
         batch_size_limit: int | Literal["auto"] | None = None,
         out: Tensor | None = None,
     ) -> Tensor | tuple[Tensor, KVCacheEntry]:  # [..., Q, C]
@@ -624,8 +638,13 @@ class TransformerBlock(torch.nn.Module):
                 "already cached"
             )
 
+        forward = (
+            self._forward
+            if _attention is None
+            else partial(self._forward, _attention=_attention)
+        )
         if torch.is_grad_enabled() or torch.compiler.is_compiling():
-            return self._forward(
+            return forward(
                 query=query,
                 key_value=key_value,
                 seqused_key_value=seqused_key_value,
@@ -680,7 +699,7 @@ class TransformerBlock(torch.nn.Module):
                 disable_chunking = True
 
         if disable_chunking:
-            return self._forward(
+            return forward(
                 query=query,
                 key_value=key_value,
                 seqused_key_value=seqused_key_value,
@@ -702,7 +721,7 @@ class TransformerBlock(torch.nn.Module):
         for start in range(0, batch_size, batch_size_limit):
             end = min(start + batch_size_limit, batch_size)
 
-            result = self._forward(
+            result = forward(
                 query=_chunk(query, batch_shape, 2, start, end),
                 key_value=_chunk(key_value, batch_shape, 2, start, end),
                 seqused_key_value=_chunk(
@@ -779,6 +798,7 @@ class TransformerBlock(torch.nn.Module):
         *,
         is_causal: bool = False,
         return_key_value: bool = False,
+        _attention: Callable[..., Tensor] | None = None,
         out: Tensor | None = None,
     ) -> Tensor | tuple[Tensor, KVCacheEntry]:  # [..., Q, C]
 
@@ -792,7 +812,12 @@ class TransformerBlock(torch.nn.Module):
         elif isinstance(key_value, Tensor):
             key_value = self.key_value_norm(key_value)
 
-        result = self.attn(
+        attention = (
+            self.attn
+            if _attention is None
+            else partial(self.attn, _attention=_attention)
+        )
+        result = attention(
             query=query if self.query_norm is None else self.query_norm(query),
             key_value=key_value,
             seqused_key_value=seqused_key_value,
