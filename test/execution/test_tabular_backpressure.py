@@ -8,13 +8,14 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 import sdm.execution._tabular_icl as icl
 
 
 class Value:
     is_cuda = True
-    device = "cuda:3"
+    device = torch.device("cuda:3")
     shape = (8, 4, 4)
 
     def __init__(self, calls: list[str], empty: bool = False) -> None:
@@ -118,8 +119,9 @@ def queue(
         SimpleNamespace(
             cuda=SimpleNamespace(
                 Event=Event,
-                current_stream=lambda device: "stream:" + device,
-            )
+                current_stream=lambda device: f"stream:{device}",
+            ),
+            is_autocast_enabled=lambda device_type: False,
         ),
     )
     monkeypatch.setattr(

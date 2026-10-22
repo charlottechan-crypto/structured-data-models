@@ -118,6 +118,10 @@ class RowEmbedding(torch.nn.Module):
         num_columns: Tensor | None = None,
         _runner: Callable[..., Any] | None = None,
     ) -> Tensor:  # [..., R, K * D]
+        if _runner is not None and num_columns is not None:
+            raise ValueError(
+                "Context-sharded row embedding does not support padded columns"
+            )
 
         *B, R, C = x.size()
         R_train = y.size(-1)
