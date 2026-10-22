@@ -228,7 +228,9 @@ def _column_forward(
 
         def compute(fulls: dict[Domain, Tensor]) -> None:
             for domain, full in fulls.items():
-                induced = full.new_empty(
+                # Native inducing queries and their residual remain FP32
+                # under autocast, unlike the expanded cell buffers.
+                induced = points.new_empty(
                     domain.stop - domain.start, points.size(0), channels
                 )
                 for start in range(domain.start, domain.stop, iw):

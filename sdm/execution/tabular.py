@@ -5,9 +5,9 @@
 
 import threading
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from types import MethodType
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import torch
 import torch.distributed as dist
@@ -99,7 +99,7 @@ def _check_output(recipe: Recipe) -> None:
 
 
 class TabularExecution:
-    """Run an explicitly owned, eager FP32/E1 tabular generation.
+    """Run an explicitly owned, eager E1 tabular generation.
 
     Construct with :func:`tabular_execution`. All ranks call every operation;
     only group rank zero supplies inputs and receives public outputs. Groups,
@@ -124,6 +124,9 @@ class TabularExecution:
         column_staging_bytes: int,
         attention_workspace_bytes: int,
         fit_head_gather_window: int | None = None,
+        owner_local_frontend: bool = False,
+        shard_row_workspace: bool = False,
+        precision: Literal["float32", "float16"] = "float32",
     ) -> None:
         self.model, self.task, self.exchange = model, task, exchange
         self._core = cast(_KumoTabular, model.models[task])
@@ -131,6 +134,9 @@ class TabularExecution:
         self.column_staging_bytes = column_staging_bytes
         self.attention_workspace_bytes = attention_workspace_bytes
         self.fit_head_gather_window = fit_head_gather_window
+        self.owner_local_frontend = owner_local_frontend
+        self.shard_row_workspace = shard_row_workspace
+        self.precision = precision
         self._lock = threading.Lock()
         self._owner_thread = threading.get_ident()
         self._thread: int | None = None
@@ -153,6 +159,9 @@ class TabularExecution:
                 column_staging_bytes,
                 attention_workspace_bytes,
                 fit_head_gather_window,
+                owner_local_frontend,
+                shard_row_workspace,
+                precision,
                 signature,
             )
         )
@@ -174,9 +183,44 @@ class TabularExecution:
             self.column_staging_bytes,
             self.attention_workspace_bytes,
             self.fit_head_gather_window,
+            self.owner_local_frontend,
+            self.shard_row_workspace,
+            self.precision,
+        )
+
+    def _check_precision(self) -> None:
+        if self.precision not in ("float32", "float16"):
+            raise ValueError("Execution precision must be float32 or float16")
+        if torch.is_autocast_enabled(self.device.type):
+            if self.precision == "float32":
+                raise ValueError("Execution does not support autocast")
+            if torch.get_autocast_dtype(self.device.type) != torch.float16:
+                raise ValueError(
+                    "Ambient autocast differs from execution precision"
+                )
+
+    def _precision_scope(self) -> AbstractContextManager:
+        # Every worker owns the same scope, even without caller autocast.
+        # Original recipe and public-processing islands disable it.
+        return (
+            nullcontext()
+            if self.precision == "float32"
+            else torch.autocast(
+                self.device.type, dtype=torch.float16, cache_enabled=True
+            )
         )
 
     def _admit(self) -> tuple[Any, ...]:
+        if torch.is_inference_mode_enabled():
+            raise ValueError("Execution does not support inference_mode")
+        if self.shard_row_workspace and (
+            not self.owner_local_frontend
+            or self.exchange.world not in (1, 2, 4, 8)
+        ):
+            raise ValueError(
+                "Sharded row workspace requires owner-local frontend "
+                "and P1/2/4/8"
+            )
         if self.fit_head_gather_window is not None and (
             type(self.fit_head_gather_window) is not int
             or self.fit_head_gather_window < 1
@@ -204,8 +248,7 @@ class TabularExecution:
             raise ValueError(
                 "Execution requires one FP32 device per task core"
             )
-        if torch.is_autocast_enabled(self.device.type):
-            raise ValueError("Execution does not support autocast")
+        self._check_precision()
         if any(
             cast(TransformerBlock, layer).attn.num_query_heads
             % self.exchange.world
@@ -267,6 +310,12 @@ class TabularExecution:
         try:
 
             def validate() -> None:
+                if operation in ("fit", "predict") and (
+                    torch.is_inference_mode_enabled()
+                ):
+                    raise ValueError(
+                        "Execution does not support inference_mode"
+                    )
                 if (
                     self.model._execution is not self
                     or _model_identity(self.model) != self._identity
@@ -274,8 +323,7 @@ class TabularExecution:
                     raise RuntimeError(
                         "The borrowed model changed; this execution is stale"
                     )
-                if torch.is_autocast_enabled(self.device.type):
-                    raise ValueError("Execution does not support autocast")
+                self._check_precision()
                 if self._policy() != self._policy_identity:
                     raise RuntimeError(
                         "Execution policy changed after admission"
@@ -289,7 +337,8 @@ class TabularExecution:
                     )
 
             self.exchange.attempt(validate)
-            yield
+            with self._precision_scope():
+                yield
             if operation in ("fit", "predict"):
                 self.exchange.attempt(self._fence)
         except BaseException as error:
@@ -365,6 +414,8 @@ class TabularExecution:
                 mask,
                 exchange,
                 self.column_staging_bytes,
+                owner_local_frontend=self.owner_local_frontend,
+                shard_row_workspace=self.shard_row_workspace,
             )
         )
         self._row_cache = OwnedCache(
@@ -391,6 +442,9 @@ class TabularExecution:
         )
         self._row_cache.freeze()
         self._icl_cache.freeze()
+        # Successful work no longer needs callbacks that keep Rows in a cycle.
+        # Failures retain the original traceback/owners instead of cleaning up.
+        rows.handlers.clear()
 
     def fit(
         self,
@@ -740,6 +794,9 @@ def tabular_execution(
     column_staging_bytes: int = 8 << 30,
     attention_workspace_bytes: int = 12 << 30,
     fit_head_gather_window: int | None = None,
+    owner_local_frontend: bool = False,
+    shard_row_workspace: bool = False,
+    precision: Literal["float32", "float16"] = "float32",
 ) -> TabularExecution:
     """Borrow a loaded model for explicit original-wave execution.
 
@@ -754,6 +811,16 @@ def tabular_execution(
         fit_head_gather_window: Optional limit on fit head gathers enqueued
             ahead of completed gathered outputs. ``None`` preserves the
             original asynchronous enqueue behavior.
+        owner_local_frontend: Experimental local intersections of native cell
+            and row windows. Changes projection geometry; trained CUDA
+            numerical equivalence and capacity require separate evidence.
+        shard_row_workspace: Further bound owner-local row-block calls to
+            max(1, native row limit // owners). Requires owner-local frontend
+            and P1/2/4/8. Default False retains the native row-window budget.
+        precision: Neural execution precision. Default float32 rejects
+            ambient autocast. Explicit float16 owns matching autocast scopes
+            on every rank; weights, prepared inputs and original processing
+            islands remain FP32. This is not half-stored model support.
 
     All ranks construct the executor and call its methods in the same order::
 
@@ -764,7 +831,8 @@ def tabular_execution(
         run.close()
 
     Each batch keeps its original shape and public recipe postprocessing.
-    This first scope is eager FP32 with one unbatched estimator, no callbacks,
+    This scope is eager with one unbatched estimator, no callbacks,
+    no outer ``torch.inference_mode()`` (tensor version fences are required),
     and no ECOC expansion beyond the native class capacity. Groups and model
     loading are caller-owned; a healthy close permits ordinary model reuse.
     """
@@ -775,4 +843,7 @@ def tabular_execution(
         column_staging_bytes,
         attention_workspace_bytes,
         fit_head_gather_window,
+        owner_local_frontend,
+        shard_row_workspace,
+        precision,
     )

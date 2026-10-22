@@ -20,6 +20,7 @@ import sdm.execution._tabular_icl as icl
 import sdm.execution.tabular as tabular
 import sdm.processing as sp
 from sdm import CategoricalTensor, Recipe, Stype, TableTensor, Task
+from sdm.cache import Cache, KVCacheEntry
 from sdm.execution import tabular_execution
 from sdm.models import KumoTabular
 from sdm.models.kumo.tabular.model import _KumoTabular
@@ -70,6 +71,10 @@ def journey(
     task: str,
     chunked: bool = False,
     fit_head_gather_window: int | None = None,
+    owner_local_frontend: bool = False,
+    context_rows: int = 11,
+    shard_row_workspace: bool = False,
+    default_recipe: bool = False,
 ) -> None:
     torch.set_num_threads(1)
     dist.init_process_group(
@@ -81,13 +86,22 @@ def journey(
     )
     try:
         model, x, y, query = fixture(task)
+        x, y = x[:context_rows], y[:context_rows]
         native = copy.deepcopy(model)
         recipe = Recipe(
             target=sp.StypeDispatch(numerical=sp.Standardize()),
             output=[sp.AverageEstimators()],
         )
+        if default_recipe:
+            recipe = None
 
         def fit(target, *args, **kwargs):
+            generator = None
+            if default_recipe:
+                generator = torch.Generator().manual_seed(42)
+                kwargs["generator"] = (
+                    generator if target is native or rank == 0 else None
+                )
             # Exercise original fit windows; query retains its native AUTO.
             with (
                 patch.object(
@@ -97,8 +111,9 @@ def journey(
                 else nullcontext()
             ):
                 target.fit(*args, **kwargs)
+            return generator
 
-        fit(native, x, y, recipe=recipe, num_estimators=1)
+        native_generator = fit(native, x, y, recipe=recipe, num_estimators=1)
         batches = [query[:2], query[2:4], query[4:6], query[6:]]
         expected = [native.predict(batch) for batch in batches]
         run = tabular_execution(
@@ -107,21 +122,62 @@ def journey(
             group=dist.group.WORLD,
             control_group=dist.group.WORLD,
             fit_head_gather_window=fit_head_gather_window,
+            owner_local_frontend=owner_local_frontend,
+            shard_row_workspace=shard_row_workspace,
         )
         for _ in range(2):
-            fit(
+            owner_generator = fit(
                 run,
                 x if rank == 0 else None,
                 y if rank == 0 else None,
                 recipe=recipe,
             )
+            if owner_local_frontend:
+                for cache in (run._row_cache, run._icl_cache):
+                    assert cache.is_replaying
+                    for key in cache:
+                        actual_cache = Cache.__getitem__(cache, key)
+                        native_cache = native._cache[0][key]
+                        if isinstance(actual_cache, KVCacheEntry):
+                            for actual_tensor, native_tensor in zip(
+                                actual_cache, native_cache, strict=True
+                            ):
+                                torch.testing.assert_close(
+                                    actual_tensor,
+                                    native_tensor.narrow(
+                                        0, cache.start, cache.length
+                                    ),
+                                    atol=2e-6,
+                                    rtol=1e-5,
+                                )
+                        elif isinstance(actual_cache, torch.Tensor):
+                            torch.testing.assert_close(
+                                actual_cache,
+                                native_cache,
+                                atol=2e-6,
+                                rtol=1e-5,
+                            )
             actual = run.predict_batches(batches if rank == 0 else None)
             if rank == 0:
+                if default_recipe:
+                    assert torch.equal(
+                        native_generator.get_state(),
+                        owner_generator.get_state(),
+                    )
                 for left, right in zip(actual, expected, strict=True):
                     assert left.columns == right.columns
+                    if task == "regression":
+                        assert left.shape[-1] == 999
                     torch.testing.assert_close(
                         left.numerical, right.numerical, atol=2e-6, rtol=1e-5
                     )
+                    if owner_local_frontend and task == "classification":
+                        assert torch.equal(
+                            left.numerical.argmax(-1),
+                            right.numerical.argmax(-1),
+                        )
+            else:
+                assert actual is None
         run.clear()
         fit(
             run,
@@ -130,6 +186,8 @@ def journey(
             recipe=recipe,
         )
         last = run.predict(query if rank == 0 else None)
+        if rank != 0:
+            assert last is None
         run.close()
         assert dist.is_initialized()
         fit(model, x, y, recipe=recipe, num_estimators=1)
@@ -158,6 +216,16 @@ def test_public_journey(tmp_path: Path, task: str, world: int) -> None:
 @pytest.mark.parametrize("task", ["classification", "regression"])
 def test_chunked_native_windows(tmp_path: Path, task: str) -> None:
     mp.spawn(journey, args=(2, str(tmp_path), task, True), nprocs=2, join=True)
+
+
+@pytest.mark.parametrize("task", ["classification", "regression"])
+def test_two_owner_default_recipe_journey(tmp_path: Path, task: str) -> None:
+    mp.spawn(
+        journey,
+        args=(2, str(tmp_path), task, False, None, False, 11, False, True),
+        nprocs=2,
+        join=True,
+    )
 
 
 @pytest.mark.parametrize("task", ["classification", "regression"])

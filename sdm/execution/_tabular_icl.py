@@ -88,21 +88,26 @@ def fit_icl(
             pending.append(done)
         return result
 
-    # Fit uses the same non-quadratic native backend policy as the accepted
-    # path. Cached GQA prediction deliberately retains native backend choice.
-    with (
-        sdpa_kernel(
-            [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
-        )
-        if full.is_cuda
-        else nullcontext()
+    # Preserve the original FP32 policy; FP16 also permits native cuDNN.
+    # Never enable quadratic math fit attention. Cached GQA prediction
+    # deliberately retains native backend choice.
+    backends = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
+    if (
+        full.is_cuda
+        and torch.is_autocast_enabled(full.device.type)
+        and torch.get_autocast_dtype(full.device.type) == torch.float16
     ):
+        backends.append(SDPBackend.CUDNN_ATTENTION)
+    with sdpa_kernel(backends) if full.is_cuda else nullcontext():
         return model(full, labels, cache=cache, _attention=attention)
 
 
 def workspace_bytes(model: ICLBlock, rows: int, cache: OwnedCache) -> int:
     """Conservative layer-local logical scratch, not total device memory."""
     context = sum(cache.lengths)
+    # Actual cache dtype controls transport; preserve conservative FP32
+    # attention scratch because native math attention can promote inputs.
+    cache_element_size = next(cache._tensors()).element_size()
     largest = 0
     for module in model.layers:
         layer = cast(TransformerBlock, module)
@@ -127,9 +132,9 @@ def workspace_bytes(model: ICLBlock, rows: int, cache: OwnedCache) -> int:
             * kv_heads
             * 2
             * width
-            * 4
+            * cache_element_size
             if len(cache.lengths) > 1
-            else compact * 4
+            else compact * cache_element_size
         )
         largest = max(largest, attention + gather)
     return largest

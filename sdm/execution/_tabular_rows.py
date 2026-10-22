@@ -37,14 +37,25 @@ class Rows:
         mask: Tensor,
         exchange: Exchange,
         staging_bytes: int,
+        *,
+        owner_local_frontend: bool = False,
+        shard_row_workspace: bool = False,
     ) -> None:
         self.encoder, self.raw, self.labels = encoder, raw, labels
         self.exchange, self.mask = exchange, mask
+        self.owner_local_frontend = owner_local_frontend
+        self.shard_row_workspace = shard_row_workspace
         self.total, self.columns = raw.shape
         self.lengths = bounds(self.total, exchange.world)
         self.start = sum(self.lengths[: exchange.rank])
         self.stop = self.start + self.lengths[exchange.rank]
         self.readouts, self.channels = encoder.readout_token.shape
+        self.dtype = (
+            torch.get_autocast_dtype(raw.device.type)
+            if torch.is_autocast_enabled(raw.device.type)
+            else raw.dtype
+        )
+        element_size = self.dtype.itemsize
         self.mean = raw.nanmean(dim=-2, keepdim=True)
         self.mean = self.mean.masked_fill(self.mean.isnan(), 0)
         self.cell_rows = self.total
@@ -53,10 +64,12 @@ class Rows:
             groups, frequencies = cell.group_size, cell.num_frequencies
             fixed = self.columns * (
                 groups * frequencies * 4
-                + groups * self.channels * 2 * frequencies * 4
-                + self.channels * 4
+                + groups * self.channels * 2 * frequencies * element_size
+                + self.channels * element_size
             )
-            item = (2 * groups * frequencies + 2 * self.channels) * 4
+            item = (
+                2 * groups * frequencies + 2 * self.channels
+            ) * element_size
             items = max((chunk_memory_limit(raw.device) - fixed) // item, 1)
             self.cell_rows = max(items // self.columns, 1)
         self.handlers: dict[torch.nn.Module, Callable[..., Any]] = {
@@ -74,13 +87,13 @@ class Rows:
             points = column.inducing_points.size(0)
             iw = min(
                 column.inducing_block.auto_batch_size_limit(
-                    raw.device, 4, points, self.total
+                    raw.device, element_size, points, self.total
                 ),
                 65_535,
             )
             ow = min(
                 column.output_block.auto_batch_size_limit(
-                    raw.device, 4, self.total, points
+                    raw.device, element_size, self.total, points
                 ),
                 65_535,
             )
@@ -91,15 +104,17 @@ class Rows:
                     owned = sum(
                         d.stop - d.start for d in domains if d.owner == peer
                     )
-                    sent = length * width * self.channels * 4
-                    received = self.total * owned * self.channels * 4
+                    sent = length * width * self.channels * element_size
+                    received = (
+                        self.total * owned * self.channels * element_size
+                    )
                     size = max(2 * (sent + received), 3 * received)
                     if (self.columns <= iw or self.columns <= ow) and owned:
                         size += (
                             self.total
                             * (self.columns + self.readouts)
                             * self.channels
-                            * 4
+                            * element_size
                         )
                     peak = max(peak, size)
             self.handlers[column] = _column_forward(
@@ -117,7 +132,10 @@ class Rows:
             tokens = self.readouts if last else self.columns + self.readouts
             limit = min(
                 block.auto_batch_size_limit(
-                    raw.device, 4, tokens, self.columns + self.readouts
+                    raw.device,
+                    element_size,
+                    tokens,
+                    self.columns + self.readouts,
                 ),
                 65_535,
             )
@@ -127,7 +145,13 @@ class Rows:
             raise ValueError(
                 "Column staging budget is too small for native windows"
             )
-        plan = (self.cell_rows, limits, row_limits)
+        plan = (
+            self.dtype,
+            self.cell_rows,
+            limits,
+            row_limits,
+            shard_row_workspace,
+        )
         if any(other != plan for other in exchange.records(plan)):
             raise ValueError("Native AUTO windows differ between owners")
 
@@ -147,10 +171,32 @@ class Rows:
     ) -> Tensor:
         del x, kwargs
         cache["cell_impute_mean"] = self.mean
+        if self.owner_local_frontend:
+            self.exchange.attempt(
+                lambda: self._local_cells(categorical_mask, out)
+            )
+            return out
         for index, start in enumerate(range(0, self.total, self.cell_rows)):
             stop = min(start + self.cell_rows, self.total)
             self._cell_window(start, stop, index, categorical_mask, out)
         return out
+
+    def _local_cells(self, mask: Tensor, out: Tensor) -> None:
+        for start in range(0, self.total, self.cell_rows):
+            left = max(start, self.start)
+            right = min(start + self.cell_rows, self.total, self.stop)
+            if left >= right:
+                continue
+            raw = self.raw[left:right]
+            missing = raw.isnan()
+            CellEmbedding.forward(
+                self.encoder.cell_embedding,
+                torch.where(missing, self.mean, raw),
+                mask,
+                batch_size_limit=None,
+                out=out[left - self.start : right - self.start],
+                missing=missing,
+            )
 
     def _cell_window(
         self, start: int, stop: int, index: int, mask: Tensor, out: Tensor
@@ -163,7 +209,10 @@ class Rows:
             if interior and self.exchange.rank != owner:
                 return None
             buffer = self.raw.new_empty(
-                stop - start, self.readouts + self.columns, self.channels
+                stop - start,
+                self.readouts + self.columns,
+                self.channels,
+                dtype=self.dtype,
             )
             buffer[:, : self.readouts] = self.encoder.readout_token
             return buffer
@@ -221,6 +270,29 @@ class Rows:
         **kwargs: Any,
     ) -> Tensor:
         del kwargs
+        if self.owner_local_frontend:
+            local_limit = (
+                max(1, limit // self.exchange.world)
+                if self.shard_row_workspace
+                else limit
+            )
+
+            def local_windows() -> None:
+                for start in range(0, self.total, limit):
+                    left = max(start, self.start)
+                    right = min(start + limit, self.total, self.stop)
+                    if left >= right:
+                        continue
+                    local = key_value[left - self.start : right - self.start]
+                    block(
+                        query=local[:, :tokens],
+                        key_value=local,
+                        out=out[left - self.start : right - self.start],
+                        batch_size_limit=local_limit,
+                    )
+
+            self.exchange.attempt(local_windows)
+            return out
         interior, boundary = [], []
         for index, start in enumerate(range(0, self.total, limit)):
             stop = min(start + limit, self.total)
