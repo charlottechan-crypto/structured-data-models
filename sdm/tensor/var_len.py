@@ -12,6 +12,7 @@ import pyarrow as pa
 import torch
 from torch import Tensor
 from torch._subclasses.fake_tensor import is_fake
+from torch.fx.experimental.symbolic_shapes import statically_known_true
 from torch.overrides import enable_reentrant_dispatch
 from typing_extensions import override
 
@@ -500,6 +501,11 @@ class VarLenTensor(Tensor):
     # Properties ##############################################################
 
     @property
+    def _logical_storage_offset(self) -> int:
+        """Expose the logical view offset as traceable Python metadata."""
+        return cast(int, self.storage_offset())
+
+    @property
     def data_offset(self) -> tuple[Tensor, Tensor]:
         r"""Return contiguous data and normalized offsets.
 
@@ -951,7 +957,7 @@ def _detach(inp: VarLenTensor) -> VarLenTensor:
         valid=inp._valid,
         size=inp.size(),
         stride=inp.stride(),
-        storage_offset=int(inp.storage_offset()),
+        storage_offset=inp._logical_storage_offset,
     )
 
 
@@ -1403,6 +1409,8 @@ def _contiguous_stride(size: Sequence[int]) -> tuple[int, ...]:
 
 
 def _span_len(size: Sequence[int], stride: Sequence[int]) -> int:
+    if len(size) == 1 and stride[0] == 1:
+        return size[0]
     if math.prod(size) == 0:
         return 0
     return 1 + sum(
@@ -1431,14 +1439,25 @@ def _from_layout_view(inp: VarLenTensor, view: Tensor) -> VarLenTensor:
     )
 
 
-def _compact(start: Tensor, end: Tensor) -> tuple[Tensor, Tensor]:
+def _compact(
+    start: Tensor, end: Tensor, *, max_total: int | None = None
+) -> tuple[Tensor, Tensor]:
+    if statically_known_true(start.numel() == 0):
+        return start.new_zeros(1), start.new_empty(0)
     count = end - start
 
     offset = count.new_empty(count.numel() + 1, dtype=torch.int64)
-    offset[0] = 0
+    offset[:1].zero_()
     offset[1:] = count.cumsum(dim=0, dtype=torch.int64)
 
-    total = int(offset[-1])
+    total = cast(int, offset[-1].item())
+    torch._constrain_as_size(total, min=0, max=torch.iinfo(torch.int64).max)
+    if max_total is not None:
+        torch._check(total <= max_total)
+        if max_total <= torch.iinfo(torch.int32).max:
+            torch._constrain_as_size(
+                total, min=0, max=torch.iinfo(torch.int32).max
+            )
     if start.dtype == torch.int32 and total <= torch.iinfo(torch.int32).max:
         offset = offset.to(torch.int32)
 
@@ -1526,4 +1545,23 @@ def _materialize(
         size=size,
         stride=stride,
         storage_offset=0,
+    )
+
+
+def _select_unique(inp: VarLenTensor, index: Tensor) -> VarLenTensor:
+    """Select distinct logical entries from a one-dimensional vocabulary."""
+    # Disjoint entries cannot contain more bytes than their backing storage.
+    # A broadcast vocabulary can repeat the same physical entry, however.
+    max_total = inp._data.numel()
+    if inp.stride(0) == 0:
+        max_total *= inp.numel()
+    positions = index * inp.stride(0) + inp._logical_storage_offset
+    start = inp._offset[positions]
+    end = inp._offset[positions + 1]
+    offset, data_index = _compact(start, end, max_total=max_total)
+    return inp.__class__(
+        data=inp._data[data_index],
+        offset=offset,
+        valid=inp._valid[positions] if inp._valid is not None else None,
+        size=index.shape,
     )

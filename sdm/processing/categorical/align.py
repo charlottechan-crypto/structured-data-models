@@ -19,6 +19,8 @@ from sdm.nn._buffer import BufferList
 from sdm.processing import EnsembleProcessor
 from sdm.relational.join import join_index
 from sdm.tensor.categorical import _iter_categories
+from sdm.tensor.string import _sort_indices
+from sdm.tensor.var_len import _select_unique
 
 _UNSIGNED_DTYPES = frozenset({torch.uint16, torch.uint32, torch.uint64})
 
@@ -107,7 +109,18 @@ class AlignCategories(EnsembleProcessor):
             order = counts.argsort(dim=1, descending=True, stable=True)
             ordered_categories = input_categories
         elif self.sort_by == "value":
-            if (
+            if torch.compiler.is_compiling() and isinstance(
+                input_categories, StringTensor
+            ):
+                perm = _string_category_order(
+                    input_categories._data,
+                    input_categories._offset,
+                    input_categories.numel(),
+                    input_categories.stride(0),
+                    input_categories._logical_storage_offset,
+                )
+                ordered_categories = input_categories
+            elif (
                 input_categories.is_cuda
                 and input_categories.dtype in _UNSIGNED_DTYPES
             ):
@@ -134,10 +147,15 @@ class AlignCategories(EnsembleProcessor):
         for batch_index in range(batch_size):
             selected_indices = order[batch_index, observed[batch_index]]
             if (
-                selected_indices.numel() == input_categories.numel()
+                not torch.compiler.is_compiling()
+                and selected_indices.numel() == input_categories.numel()
                 and self.sort_by != "frequency"
             ):
                 fitted_categories.append(ordered_categories)
+            elif isinstance(input_categories, StringTensor):
+                fitted_categories.append(
+                    _select_unique(input_categories, selected_indices)
+                )
             elif (
                 input_categories.dtype in _UNSIGNED_DTYPES
                 and input_categories.is_cpu
@@ -535,3 +553,34 @@ class AlignCategories(EnsembleProcessor):
         return (
             f"{' ' * indent}{self.__class__.__name__}({', '.join(arguments)})"
         )
+
+
+@torch.library.custom_op("sdm::string_category_order", mutates_args=())
+def _string_category_order(
+    data: Tensor,
+    offset: Tensor,
+    size: int,
+    stride: int,
+    storage_offset: int,
+) -> Tensor:
+    """Expose the existing external string sort as a fixed-size permutation."""
+    categories = StringTensor(
+        data=data,
+        offset=offset,
+        valid=None,
+        size=(size,),
+        stride=(stride,),
+        storage_offset=storage_offset,
+    )
+    return _sort_indices(categories)
+
+
+@_string_category_order.register_fake
+def _string_category_order_fake(
+    data: Tensor,
+    offset: Tensor,
+    size: int,
+    stride: int,
+    storage_offset: int,
+) -> Tensor:
+    return data.new_empty((size,), dtype=torch.int64)

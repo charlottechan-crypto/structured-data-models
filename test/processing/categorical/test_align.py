@@ -504,3 +504,44 @@ def test_align_categories_ensemble_matches_member_fits(
         expected_query = reference.transform(query)
         assert query_output[member_id].equal(expected_query)
         assert fitted_query_output[member_id].equal(expected_query)
+
+
+@pytest.mark.parametrize("sort_by", ["code", "frequency", "value"])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_align_categories_compiled_retention(
+    sort_by: Literal["code", "frequency", "value"],
+    dtype: torch.dtype,
+) -> None:
+    processor = AlignCategories(sort_by=sort_by, min_frequency=2)
+    fit_transform = torch.compile(
+        processor.fit_transform, backend="inductor", fullgraph=True
+    )
+    categories = StringTensor.from_list(
+        ["red", "blué", "", "unused"], offset_dtype=dtype
+    )
+    # Change the retained vocabulary, including empty and complete subsets.
+    for values in (
+        [0, 1, 1, -1, -1, -1, -1, -1],
+        [2, 0, 2, 2, -1, 0, -1, -1],
+        [-1] * 8,
+        [0, 0, 1, 1, 2, 2, 3, 3],
+    ):
+        table = TableTensor(
+            categorical=CategoricalTensor(
+                torch.tensor(values, dtype=dtype).view(-1, 1),
+                categories=(categories,),
+            )
+        )
+        expected = AlignCategories(
+            sort_by=sort_by, min_frequency=2
+        ).fit_transform(table)
+        actual = fit_transform(table)
+        assert torch.equal(actual.categorical.code, expected.categorical.code)
+        assert (
+            actual.categorical.categories[0].tolist()
+            == expected.categorical.categories[0].tolist()
+        )
+        assert actual.categorical.code.dtype == dtype
+        vocabulary = actual.categorical.categories[0]
+        assert isinstance(vocabulary, StringTensor)
+        assert vocabulary._offset.dtype == dtype
