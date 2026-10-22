@@ -6,10 +6,17 @@ from typing import Literal, cast
 import torch
 from torch import Tensor
 
-from sdm import CategoricalTensor, EnsembleTable, Stype, TableTensor
+from sdm import (
+    CategoricalTensor,
+    EnsembleTable,
+    Stype,
+    TableTensor,
+    VarLenTensor,
+)
 from sdm.nn._buffer import BufferList
 from sdm.processing import EnsembleProcessor
 from sdm.tensor.categorical import _iter_categories
+from sdm.tensor.var_len import _select_unique
 
 
 class ShuffleCategories(EnsembleProcessor):
@@ -197,7 +204,12 @@ class ShuffleCategories(EnsembleProcessor):
                 code[..., index] = torch.where(
                     valid, mapped.to(codes.dtype), codes
                 )
-            categories.append(category[permutation.argsort()])
+            order = permutation.argsort()
+            categories.append(
+                _select_unique(category, order)
+                if isinstance(category, VarLenTensor)
+                else category[order]
+            )
 
         categorical = CategoricalTensor(
             code=code,

@@ -118,6 +118,32 @@ def test_shuffle_categories_preserves_missing() -> None:
     assert output.categorical.tolist() == target.categorical.tolist()
 
 
+def test_compiled_shuffle_categories_preserves_string_views(
+    compilation: None,
+) -> None:
+    category = StringTensor.from_list(["a", "unused", "é", "unused", "long"])
+    table = TableTensor(
+        categorical=CategoricalTensor(
+            code=torch.tensor([[0], [1], [2], [-1], [-2]], dtype=torch.int64),
+            categories=(category[::2],),
+        ),
+    )
+    processor = ShuffleCategories().fit(table)
+    transform = torch.compile(
+        processor.transform, backend="eager", fullgraph=True
+    )
+
+    for query in (table, table[:2]):
+        expected = processor.transform(query)
+        actual = transform(query)
+        assert actual.categorical.code.dtype == query.categorical.code.dtype
+        assert actual.categorical.code.equal(expected.categorical.code)
+        assert actual.categorical.tolist() == query.categorical.tolist()
+        assert actual.categorical.categories[0].tolist() == (
+            expected.categorical.categories[0].tolist()
+        )
+
+
 @pytest.mark.parametrize("categories", [(), ("a", "b")])
 def test_shuffle_categories_preserves_all_missing(
     categories: tuple[str, ...],
