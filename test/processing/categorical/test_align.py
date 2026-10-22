@@ -509,6 +509,7 @@ def test_align_categories_ensemble_matches_member_fits(
 @pytest.mark.parametrize("sort_by", ["code", "frequency", "value"])
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 def test_align_categories_compiled_retention(
+    compilation: None,
     sort_by: Literal["code", "frequency", "value"],
     dtype: torch.dtype,
 ) -> None:
